@@ -2,8 +2,6 @@
  * bot.js
  * Node.js script: watches Raydium pools, performs rug-checks, buys then sells at 2x.
  *
- * WARNING: This is an example starter. Test on devnet and with tiny amounts.
- *
  * Required env vars in .env:
  *  RPC_URL=your-solana-rpc
  *  PRIVATE_KEY_BASE58=base58-encoded-private-key OR a JSON array of secretKey bytes
