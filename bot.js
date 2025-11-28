@@ -20,16 +20,15 @@ const BUY_USD = Number(process.env.BUY_USD) || 5; // amount in USD (approx) to b
 const TARGET_MULTIPLIER = Number(process.env.TARGET_MULTIPLIER) || 2;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 15_000; // 15s
 
-// Wallet loading (supports base58 or JSON array)
 function loadKeypair() {
   if (!process.env.PRIVATE_KEY_BASE58) throw new Error('Set PRIVATE_KEY_BASE58 in .env');
   try {
-    const maybeJson = JSON.parse(process.env.PRIVATE_KEY_BASE58);
-    if (Array.isArray(maybeJson)) {
-      return Keypair.fromSecretKey(Uint8Array.from(maybeJson));
+    const arr = JSON.parse(process.env.PRIVATE_KEY_BASE58);
+    if (Array.isArray(arr)) {
+      return Keypair.fromSecretKey(Uint8Array.from(arr));
     }
-  } catch (e) {}
-  // assume base58
+  } catch (_) {}
+  
   const secret = bs58.decode(process.env.PRIVATE_KEY_BASE58);
   return Keypair.fromSecretKey(secret);
 }
