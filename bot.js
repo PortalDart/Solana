@@ -5,20 +5,23 @@
  * Required env vars in .env:
  *  RPC_URL=your-solana-rpc
  *  PRIVATE_KEY_BASE58=base58-encoded-private-key OR a JSON array of secretKey bytes
- *  RAYDIUM_API=https://api-v3.raydium.io
+ *  RAYDIUM_API=https://api.raydium.io/v2 (updated API endpoint)
+ *  QUOTE_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (USDC)
  */
 
 require('dotenv').config();
-const { Connection, Keypair, PublicKey, Transaction, sendAndConfirmRawTransaction } = require('@solana/web3.js');
-const { getMint } = require('@solana/spl-token');
+const { Connection, Keypair, PublicKey, Transaction, VersionedTransaction } = require('@solana/web3.js');
+const { getMint, getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, getAccount } = require('@solana/spl-token');
 const axios = require('axios');
 const bs58 = require('bs58');
 
-const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com'; // TODO: change to your node (or devnet for tests)
-const RAYDIUM_API = process.env.RAYDIUM_API || 'https://api-v3.raydium.io';
-const BUY_USD = Number(process.env.BUY_USD) || 5; // amount in USD (approx) to buy when new token found
+const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+const RAYDIUM_API = process.env.RAYDIUM_API || 'https://api.raydium.io/v2';
+const BUY_USD = Number(process.env.BUY_USD) || 5;
 const TARGET_MULTIPLIER = Number(process.env.TARGET_MULTIPLIER) || 2;
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 15_000; // 15s
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 15000;
+const QUOTE_MINT = process.env.QUOTE_MINT || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'; // USDC
+const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS || 200; // 2% slippage
 
 function loadKeypair() {
   if (!process.env.PRIVATE_KEY_BASE58) throw new Error('Set PRIVATE_KEY_BASE58 in .env');
@@ -34,235 +37,458 @@ function loadKeypair() {
 }
 
 const wallet = loadKeypair();
-const connection = new Connection(RPC_URL, 'confirmed');
+const connection = new Connection(RPC_URL, {
+  commitment: 'confirmed',
+  confirmTransactionInitialTimeout: 60000
+});
 
-// Minimal in-memory state
+// State management
 const seenPools = new Set();
-const positions = new Map(); // tokenMint -> { buyPrice, amount, txSignature, boughtAt }
+const positions = new Map(); // tokenMint -> { buyPrice, amount, buyTx, boughtAt, quoteMint }
 
-async function listPoolsFromRaydium() {
-  // Raydium API exposes pools, pairs, etc.
-  // We'll fetch pools list; the API docs recommend https://api-v3.raydium.io/
+// Use correct Raydium API endpoint for new pools
+async function listNewPoolsFromRaydium() {
   try {
-    const res = await axios.get(`${RAYDIUM_API}/amm/main/pools` , { timeout: 8000 });
-    return res.data || [];
+    // Raydium v2 API for new pools - much more reliable
+    const res = await axios.get(`${RAYDIUM_API}/main/pools`, { timeout: 10000 });
+    
+    if (res.data && res.data.success && res.data.data) {
+      return res.data.data;
+    }
+    
+    // Alternative endpoint if above doesn't work
+    const altRes = await axios.get(`${RAYDIUM_API}/sdk/pairs`, { timeout: 10000 });
+    return altRes.data || [];
   } catch (err) {
-    console.error('Failed to fetch pools from Raydium API:', err.message);
+    console.error('Failed to fetch pools:', err.message);
     return [];
   }
 }
 
-// -- RUG CHECKS (heuristics) --
-async function rugChecks(tokenMintStr) {
+// Enhanced rug checks
+async function performRugChecks(tokenMintStr) {
   try {
     const tokenMint = new PublicKey(tokenMintStr);
-    // 1) Mint info: is mintAuthority null? null -> cannot mint more (good)
+    
+    // 1) Check mint authority
     const mintInfo = await getMint(connection, tokenMint);
     const hasMintAuthority = mintInfo.mintAuthority !== null;
+    const hasFreezeAuthority = mintInfo.freezeAuthority !== null;
+    
     if (hasMintAuthority) {
-      console.warn(`[RUG CHECK] Token ${tokenMintStr} STILL has mint authority. HIGH RISK.`);
+      console.warn(`[RUG CHECK] Token ${tokenMintStr} has mint authority - HIGH RISK`);
       return { safe: false, reason: 'mintAuthorityPresent' };
     }
-
-    // 2) Largest token accounts: check concentration
-    const largest = await connection.getTokenLargestAccounts(tokenMint);
-    if (!largest || !largest.value || largest.value.length === 0) {
-      return { safe: false, reason: 'noTokenAccounts' };
+    
+    if (hasFreezeAuthority) {
+      console.warn(`[RUG CHECK] Token ${tokenMintStr} has freeze authority - MEDIUM RISK`);
     }
-    // sum top 3 holders
-    const topAccounts = largest.value.slice(0, 3);
-    // convert strings -> numbers; amounts are strings
+
+    // 2) Check supply and decimals
+    const supply = Number(mintInfo.supply);
+    const decimals = mintInfo.decimals;
+    
+    if (supply === 0) {
+      return { safe: false, reason: 'zero_supply' };
+    }
+    
+    if (decimals > 18) {
+      console.warn(`[RUG CHECK] Token has ${decimals} decimals - HIGH RISK`);
+      return { safe: false, reason: 'excessive_decimals' };
+    }
+
+    // 3) Check holder concentration
+    const largest = await connection.getTokenLargestAccounts(tokenMint);
+    if (!largest.value || largest.value.length === 0) {
+      return { safe: false, reason: 'no_token_accounts' };
+    }
+    
+    // Check top 5 holders
+    const topAccounts = largest.value.slice(0, 5);
     let totalTop = 0;
     for (const acc of topAccounts) totalTop += Number(acc.amount);
-    // Need total supply to compute percent; use mintInfo.supply
-    const supply = Number(mintInfo.supply);
-    const topPercent = supply > 0 ? (totalTop / supply) * 100 : 100;
-    if (topPercent > 50) {
-      console.warn(`[RUG CHECK] Top holders contain ${topPercent.toFixed(1)}% of supply. HIGH RISK.`);
+    
+    const topPercent = (totalTop / supply) * 100;
+    if (topPercent > 70) {
+      console.warn(`[RUG CHECK] Top 5 holders control ${topPercent.toFixed(1)}% - HIGH RISK`);
       return { safe: false, reason: 'concentrated_holders', topPercent };
     }
-
-    // 3) decimals sanity check and supply sanity (very large supply may be weird)
-    if (mintInfo.decimals > 9 || supply === 0) {
-      return { safe: false, reason: 'weird_mint' };
-    }
-
-    // 4) (Optional) Check program-owned accounts, or look for recent big transfers
-    // We leave more sophisticated ML checks or third-party scanners to specialized services.
-
-    return { safe: true };
-  } catch (err) {
-    console.error('rugChecks failed for', tokenMintStr, err.message);
-    return { safe: false, reason: 'error' };
-  }
-}
-
-// -- Price helpers: estimate token price via Raydium pool reserves (simple)
-function estimatePriceFromPool(pool) {
-  // Raydium pool object usually contains reserves and token mints in pool.baseMint and pool.quoteMint
-  // Example pool structure depends on API; attempt safe access
-  try {
-    // many Raydium pools expose 'liquidity', 'tokenA', 'tokenB' fields. Try to handle common shapes.
-    const { tokenA, tokenB } = pool; // if API returns these
-    if (tokenA && tokenB && tokenA.price && tokenB.price) {
-      // If API provides price fields, use them
-      // we return price relative to USD if available, otherwise price ratio
-      return tokenA.price; // placeholder; real mapping depends on API
-    }
-    // As fallback, if pool has reserves:
-    if (pool.reserve0 && pool.reserve1 && pool.token0 && pool.token1) {
-      // If we know which is USDC/usdt, compute token price in USD
-      // This is API specific; user should adapt based on the pool shape returned by Raydium.
-      return null;
-    }
-    return null;
-  } catch (e) {
-    return null;
-  }
-}
-
-/**
- * swapViaRaydiumTradeAPI
- * Raydium Trade API provides a way to obtain an unsigned transaction payload, which you sign and send.
- * We attempt to:
- *  1) request trade payload/quote from Raydium trade endpoint
- *  2) sign the returned serialized transaction locally
- *  3) submit via RPC
- *
- * NOTE: Raydium's trade endpoints and payload shapes may change. Inspect the Raydium docs if this errors.
- */
-async function swapViaRaydiumTradeAPI({ fromMint, toMint, amount, slippage = 1 }) {
-  // This is a high-level example. The exact route & request body depends on Raydium's /trade endpoints.
-  try {
-    // 1) Ask Raydium for unsigned txn / quote
-    const payloadResp = await axios.post(`${RAYDIUM_API}/trade/quote`, {
-      sourceMint: fromMint,
-      destinationMint: toMint,
-      amount: amount.toString(),
-      slippage,
-      userPublicKey: wallet.publicKey.toBase58()
-    }, { timeout: 8000 });
-
-    if (!payloadResp.data || !payloadResp.data.unsignedTx) {
-      console.error('Raydium trade API did not return unsigned transaction:', payloadResp.data);
-      return null;
-    }
-
-    const unsignedTxBase64 = payloadResp.data.unsignedTx; // assume base64 tx
-    const txBuffer = Buffer.from(unsignedTxBase64, 'base64');
-    const tx = Transaction.from(txBuffer);
-
-    // sign locally
-    tx.partialSign(wallet);
-    const signed = tx.serialize();
-
-    // send
-    const sig = await connection.sendRawTransaction(signed, { skipPreflight: false });
-    console.log('Swap tx sent sig:', sig);
-    await connection.confirmTransaction(sig, 'finalized');
-    return sig;
-  } catch (err) {
-    console.error('swapViaRaydiumTradeAPI error:', err.response ? err.response.data : err.message);
-    return null;
-  }
-}
-
-// Worker: process new pools
-async function processPool(pool) {
-  // Example pool object: inspect with console.log when testing
-  const poolId = pool.id || pool.ammId || pool.address || pool.lpMint;
-  if (!poolId) return;
-  if (seenPools.has(poolId)) return;
-
-  // Mark seen
-  seenPools.add(poolId);
-
-  // Determine token mint for the token you want to monitor.
-  // Many Raydium pools are tokenA/tokenB. This code assumes tokenA is the new token and tokenB is a common quote (USDC/USDT/SOL)
-  const tokenMint = (pool.tokenA && pool.tokenA.mint) || pool.baseMint || pool.tokenMintA || null;
-  const quoteMint = (pool.tokenB && pool.tokenB.mint) || pool.quoteMint || pool.tokenMintB || null;
-
-  if (!tokenMint) {
-    console.log('Pool discovered but could not find token mint shape. Pool sample:', poolId);
-    return;
-  }
-
-  console.log('New pool detected:', poolId, 'token:', tokenMint);
-
-  // Run rug checks
-  const rc = await rugChecks(tokenMint);
-  if (!rc.safe) {
-    console.warn('Rug checks failed:', rc);
-    return;
-  }
-
-  // Estimate price (best effort). If you cannot get price, skip or buy a tiny amount for testing.
-  const price = estimatePriceFromPool(pool);
-  console.log('Estimated price (may be null):', price);
-
-  // Decide buy amount (amount in token units). If price null, buy a small amount by specifying quote currency
-  // For simplicity we'll attempt to buy BUY_USD worth of quoteMint -> tokenMint using Raydium Trade API
-  const quoteAmount = BUY_USD; // Raydium API may expect amount in quote smallest unit; adapt accordingly.
-
-  console.log(`Attempting buy for ${tokenMint} using ${quoteMint} for approx ${BUY_USD} USD`);
-
-  const buySig = await swapViaRaydiumTradeAPI({
-    fromMint: quoteMint, // e.g., USDC mint
-    toMint: tokenMint,
-    amount: Math.round(quoteAmount * 1e6), // placeholder: convert to lamports/decimals accordingly
-    slippage: 2
-  });
-
-  if (!buySig) {
-    console.error('Buy failed or returned no signature.');
-    return;
-  }
-
-  // Record position - in a real bot you'd parse logs or query token account to get exact amount bought & price.
-  const buyPrice = price || null;
-  positions.set(tokenMint, { buyPrice, amount: null, txSignature: buySig, boughtAt: Date.now() });
-  console.log('Position recorded for', tokenMint, 'sig', buySig);
-}
-
-// Monitor loop
-async function monitorLoop() {
-  console.log('Starting monitor loop. Wallet:', wallet.publicKey.toBase58());
-  setInterval(async () => {
+    
+    // 4) Check if LP is burned (locked)
     try {
-      const pools = await listPoolsFromRaydium();
-      if (!pools || pools.length === 0) {
-        return;
+      const tokenAccounts = await connection.getTokenAccountsByOwner(
+        new PublicKey(tokenMintStr),
+        { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') }
+      );
+      
+      if (tokenAccounts.value.length === 0) {
+        console.warn(`[RUG CHECK] No token accounts found for mint`);
       }
-      // iterate pools; filter by token symbols or min liquidity if you wish
-      for (const pool of pools) {
-        // optional filter: skip pools that aren't new tokens or that don't match your interest
-        await processPool(pool);
-      }
+    } catch (err) {
+      console.warn(`[RUG CHECK] Could not fetch token accounts: ${err.message}`);
+    }
 
-      // Check positions for selling condition (2x)
-      for (const [tokenMint, pos] of positions.entries()) {
-        // Try estimate current price via Raydium API / pool lookup (left as a placeholder)
-        // If buyPrice is null we might skip sell logic or fetch last trade price
-        const currentPrice = null; // TODO: implement pool -> USD price translation
-        if (pos.buyPrice && currentPrice && currentPrice >= pos.buyPrice * TARGET_MULTIPLIER) {
-          console.log(`SELL CONDITION met for ${tokenMint} - attempting sell.`);
-          // Call swap API in reverse direction
-          const sellSig = await swapViaRaydiumTradeAPI({
-            fromMint: tokenMint,
-            toMint: /* your quote mint (USDC) */ null,
-            amount: /* token amount */ 0,
-            slippage: 2
-          });
-          if (sellSig) {
-            console.log('Sold', tokenMint, 'tx', sellSig);
-            positions.delete(tokenMint);
-          }
+    return { 
+      safe: true, 
+      details: {
+        supply,
+        decimals,
+        topPercent
+      }
+    };
+  } catch (err) {
+    console.error('Rug checks failed:', err.message);
+    return { safe: false, reason: 'check_failed', error: err.message };
+  }
+}
+
+// Get token price from Raydium
+async function getTokenPrice(tokenMint, quoteMint = QUOTE_MINT) {
+  try {
+    // Use Raydium price API
+    const res = await axios.get(
+      `${RAYDIUM_API}/main/price?mint=${tokenMint}`,
+      { timeout: 5000 }
+    );
+    
+    if (res.data && res.data.data) {
+      return parseFloat(res.data.data.price);
+    }
+    
+    // Alternative: fetch pool data
+    const poolRes = await axios.get(
+      `${RAYDIUM_API}/main/pair?mint=${tokenMint}`,
+      { timeout: 5000 }
+    );
+    
+    if (poolRes.data && poolRes.data.data && poolRes.data.data.price) {
+      return parseFloat(poolRes.data.data.price);
+    }
+    
+    return null;
+  } catch (err) {
+    console.error('Price fetch failed:', err.message);
+    return null;
+  }
+}
+
+// Get quote for swap using Raydium API
+async function getSwapQuote(fromMint, toMint, amount, slippageBps = SLIPPAGE_BPS) {
+  try {
+    const res = await axios.get(`${RAYDIUM_API}/main/quote`, {
+      params: {
+        inputMint: fromMint,
+        outputMint: toMint,
+        amount: amount.toString(),
+        slippageBps: slippageBps.toString()
+      },
+      timeout: 10000
+    });
+    
+    if (res.data && res.data.success && res.data.data) {
+      return res.data.data;
+    }
+    return null;
+  } catch (err) {
+    console.error('Get quote error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+// Execute swap using Raydium API
+async function executeSwap(quoteData) {
+  try {
+    // Get swap transaction from Raydium
+    const res = await axios.post(
+      `${RAYDIUM_API}/main/swap`,
+      {
+        quoteResponse: quoteData,
+        userPublicKey: wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+        useSharedAccounts: true,
+        computeUnitPriceMicroLamports: 100000 // Priority fee
+      },
+      { timeout: 15000 }
+    );
+    
+    if (!res.data || !res.data.success || !res.data.data) {
+      console.error('Swap API failed:', res.data);
+      return null;
+    }
+    
+    const { transaction } = res.data.data;
+    
+    // Deserialize and sign transaction
+    const txBuffer = Buffer.from(transaction, 'base64');
+    const tx = VersionedTransaction.deserialize(txBuffer);
+    
+    // Sign the transaction
+    tx.sign([wallet]);
+    
+    // Send transaction
+    const rawTransaction = tx.serialize();
+    const signature = await connection.sendRawTransaction(rawTransaction, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+      maxRetries: 3
+    });
+    
+    console.log('Transaction sent:', signature);
+    
+    // Wait for confirmation
+    const confirmation = await connection.confirmTransaction({
+      signature,
+      blockhash: tx.message.recentBlockhash,
+      lastValidBlockHeight: tx.message.lastValidBlockHeight
+    }, 'confirmed');
+    
+    if (confirmation.value.err) {
+      console.error('Transaction failed:', confirmation.value.err);
+      return null;
+    }
+    
+    console.log('Transaction confirmed:', signature);
+    return signature;
+  } catch (err) {
+    console.error('Execute swap error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+// Check and create token account if needed
+async function ensureTokenAccount(mint) {
+  try {
+    const tokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(mint),
+      wallet.publicKey
+    );
+    
+    const accountInfo = await connection.getAccountInfo(tokenAccount);
+    
+    if (!accountInfo) {
+      console.log('Creating token account for:', mint);
+      const transaction = new Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          tokenAccount,
+          wallet.publicKey,
+          new PublicKey(mint)
+        )
+      );
+      
+      const signature = await connection.sendTransaction(transaction, [wallet]);
+      await connection.confirmTransaction(signature, 'confirmed');
+      console.log('Token account created:', signature);
+    }
+    
+    return tokenAccount;
+  } catch (err) {
+    console.error('Ensure token account failed:', err.message);
+    return null;
+  }
+}
+
+// Process new pool
+async function processNewPool(pool) {
+  try {
+    const poolId = pool.id || pool.address;
+    if (!poolId || seenPools.has(poolId)) return;
+    
+    seenPools.add(poolId);
+    
+    // Extract token information - adjust based on actual API response
+    const baseMint = pool.baseMint || pool.tokenA?.mint;
+    const quoteMint = pool.quoteMint || pool.tokenB?.mint || QUOTE_MINT;
+    
+    if (!baseMint) {
+      console.log('No base mint found for pool:', poolId);
+      return;
+    }
+    
+    // Check if it's actually a new token (not USDC, USDT, SOL, etc.)
+    const knownMints = [
+      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+      'So11111111111111111111111111111111111111112', // SOL
+      'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
+    ];
+    
+    if (knownMints.includes(baseMint)) {
+      return; // Skip known tokens
+    }
+    
+    console.log('New pool detected:', {
+      poolId,
+      baseMint,
+      quoteMint,
+      name: pool.name || 'Unknown'
+    });
+    
+    // Perform rug checks
+    const rugCheck = await performRugChecks(baseMint);
+    if (!rugCheck.safe) {
+      console.warn('Rug checks failed:', rugCheck.reason);
+      return;
+    }
+    
+    console.log('Rug checks passed:', rugCheck.details);
+    
+    // Get current price
+    const currentPrice = await getTokenPrice(baseMint, quoteMint);
+    if (!currentPrice || currentPrice <= 0) {
+      console.warn('Could not get valid price for token:', baseMint);
+      return;
+    }
+    
+    console.log('Current price:', currentPrice);
+    
+    // Calculate buy amount in quote tokens
+    const quoteAmount = BUY_USD / currentPrice;
+    const quoteDecimals = quoteMint === QUOTE_MINT ? 6 : 9; // Adjust based on token
+    const rawAmount = Math.floor(quoteAmount * Math.pow(10, quoteDecimals));
+    
+    if (rawAmount <= 0) {
+      console.warn('Buy amount too small');
+      return;
+    }
+    
+    // Ensure we have token account
+    await ensureTokenAccount(baseMint);
+    
+    // Get swap quote
+    const quoteData = await getSwapQuote(quoteMint, baseMint, rawAmount);
+    if (!quoteData) {
+      console.error('Failed to get swap quote');
+      return;
+    }
+    
+    console.log('Swap quote received:', {
+      inAmount: quoteData.inAmount,
+      outAmount: quoteData.outAmount,
+      priceImpact: quoteData.priceImpact
+    });
+    
+    // Execute buy
+    const buySignature = await executeSwap(quoteData);
+    if (!buySignature) {
+      console.error('Buy failed');
+      return;
+    }
+    
+    // Record position
+    const tokenAmount = parseFloat(quoteData.outAmount) / Math.pow(10, rugCheck.details.decimals);
+    
+    positions.set(baseMint, {
+      buyPrice: currentPrice,
+      amount: tokenAmount,
+      buyTx: buySignature,
+      boughtAt: Date.now(),
+      quoteMint,
+      targetPrice: currentPrice * TARGET_MULTIPLIER
+    });
+    
+    console.log(`Position opened: ${tokenAmount} tokens at $${currentPrice}, target: $${currentPrice * TARGET_MULTIPLIER}`);
+    
+  } catch (err) {
+    console.error('Process pool error:', err.message);
+  }
+}
+
+// Check and sell positions
+async function checkAndSellPositions() {
+  for (const [tokenMint, position] of positions.entries()) {
+    try {
+      const currentPrice = await getTokenPrice(tokenMint, position.quoteMint);
+      
+      if (!currentPrice) {
+        console.warn('Could not fetch price for:', tokenMint);
+        continue;
+      }
+      
+      console.log(`Position ${tokenMint}: Bought at $${position.buyPrice}, Current: $${currentPrice}, Target: $${position.targetPrice}`);
+      
+      // Check if we hit target or if position is old (24h limit)
+      const positionAge = Date.now() - position.boughtAt;
+      const isOldPosition = positionAge > 24 * 60 * 60 * 1000; // 24 hours
+      
+      if (currentPrice >= position.targetPrice || isOldPosition) {
+        const reason = isOldPosition ? '24h timeout' : 'target reached';
+        console.log(`Selling ${tokenMint} - ${reason}`);
+        
+        // Calculate sell amount (full position)
+        const rawAmount = Math.floor(position.amount * Math.pow(10, 9)); // Assuming token decimals
+        
+        // Get sell quote
+        const quoteData = await getSwapQuote(tokenMint, position.quoteMint, rawAmount);
+        if (!quoteData) {
+          console.error('Failed to get sell quote');
+          continue;
+        }
+        
+        // Execute sell
+        const sellSignature = await executeSwap(quoteData);
+        if (sellSignature) {
+          console.log(`Sold position: ${tokenMint}, Tx: ${sellSignature}`);
+          positions.delete(tokenMint);
         }
       }
     } catch (err) {
-      console.error('monitorLoop error', err.message);
+      console.error(`Error checking position ${tokenMint}:`, err.message);
+    }
+  }
+}
+
+// Main monitoring loop
+async function startMonitor() {
+  console.log('Starting bot with wallet:', wallet.publicKey.toString());
+  console.log('Settings:', {
+    BUY_USD,
+    TARGET_MULTIPLIER,
+    POLL_INTERVAL_MS,
+    QUOTE_MINT
+  });
+  
+  // Initial pool fetch
+  const initialPools = await listNewPoolsFromRaydium();
+  console.log(`Found ${initialPools.length} initial pools`);
+  
+  // Start monitoring
+  setInterval(async () => {
+    try {
+      console.log('\n--- Checking for new pools ---');
+      const pools = await listNewPoolsFromRaydium();
+      
+      if (pools && pools.length > 0) {
+        // Process only first 3 new pools per interval to avoid rate limiting
+        const newPools = pools.slice(0, 3);
+        
+        for (const pool of newPools) {
+          await processNewPool(pool);
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Delay between processing
+        }
+      }
+      
+      // Check existing positions
+      if (positions.size > 0) {
+        console.log(`\n--- Checking ${positions.size} positions ---`);
+        await checkAndSellPositions();
+      }
+      
+    } catch (err) {
+      console.error('Monitor iteration error:', err.message);
     }
   }, POLL_INTERVAL_MS);
 }
 
-monitorLoop();
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nShutting down bot...');
+  console.log('Active positions:', positions.size);
+  process.exit(0);
+});
+
+// Start the bot
+startMonitor().catch(err => {
+  console.error('Failed to start bot:', err);
+  process.exit(1);
+});
